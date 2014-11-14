@@ -1,17 +1,18 @@
 #include <iostream>
 #include <string.h>
 #include <cstdlib>
-#include <cmath>
-//#include <mpi/mpi.h>
+#include <mpi/mpi.h>
 
 using namespace std;
 
 #define BORDER "*********************************"
 
-#define STD_M_SIZE 2
-#define STD_STEP 0.0001
+#define STD_M_SIZE 1000
+#define STD_STEP 0.001
 #define MAX_TIME 1.0
 #define INIT_VAL 1.0
+
+#define ROOT 0
 
 void printBorder(){
     cout << BORDER << endl;
@@ -80,8 +81,9 @@ public:
     }
 
     Matrix& fillE(){
+        srand((unsigned)time(NULL));
         for (int i = 0; i < size; ++i){
-            data[i][i] = 1;
+            data[i][i] = (rand() / (double)RAND_MAX - 0.5 * 100);
         }
         return *this;
     }
@@ -139,6 +141,19 @@ public:
         return res;
     }
 
+    double * partiallyMultiply(double * vector, const int startInd, const int endInt) const{
+        double * res = new double [size];
+
+        for (int i = startInd; i < endInt; ++i){
+            res[i] = 0;
+            for (int k = 0; k < size; ++k){
+                res[i] += data[i][k] * vector[k];
+            }
+        }
+
+        return res;
+    }
+
     Matrix& addE(){
         for (int i = 0; i < size; ++i){
             data[i][i] += 1;
@@ -155,6 +170,7 @@ public:
             cout << endl;
         }
         printBorder();
+        cout.flush();
         return *this;
     }
 
@@ -170,24 +186,77 @@ public:
 };
 
 int main(int argc, char **argv) {
-    int size = STD_M_SIZE;
+    const int size = STD_M_SIZE;
     double step = STD_STEP;
 
+    int processNum, processCount;
+    MPI_Init(&argc, &argv);
+    MPI_Comm_size(MPI_COMM_WORLD, &processCount);
+    MPI_Comm_rank(MPI_COMM_WORLD, &processNum);
+
+    double timeGenStart = MPI_Wtime();
     Matrix A(size);
-    A.fill();
+    A.fillE();
     A.RungeOperator(step);
-    A.print();
+    double timeGenEnd = MPI_Wtime();
+
+    if (processNum == ROOT){
+        //cout << "Runge operator matrix: " << endl;
+        cout << "time used to generate matrix: " << timeGenEnd - timeGenStart << " seconds." << endl;
+        //A.print();
+        cout.flush();
+    }
+
+    int rowCount = (size / processCount) + (size % processCount > processNum ? 1 : 0);
+    int endInd;
+    MPI_Scan(&rowCount, &endInd, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+    int startInd = endInd - rowCount;
+
+    int * displs = new int[processCount];
+    int * sendcnts = new int[processCount];
+    MPI_Allgather(&rowCount, 1, MPI_INT, sendcnts, 1, MPI_INT, MPI_COMM_WORLD);
+    displs[0] = 0;
+    for (int i = 1; i < processCount; ++i){
+        displs[i] = displs[i-1] + sendcnts[i-1];
+    }
+
+//    cout << "Process: " << processNum << ". Start: " << startInd << ". End: " << endInd << endl;
+//    cout.flush();
+//
+//    MPI_Barrier(MPI_COMM_WORLD);
 
     double * tmpVec = initVector(size);
     double time = 0;
+    double transferTime = 0;
+    double workStart = MPI_Wtime();
     while (time <= MAX_TIME){
-        cout << "Time: " << time << ". Values: ";
-        printVector(tmpVec, size);
-        double * buf = A.multiply(tmpVec);
+//        if (processNum == ROOT){
+//            cout << "Time: " << time << ". Values: ";
+//            printVector(tmpVec, size);
+//            cout.flush();
+//        }
+
+        double * buf = A.partiallyMultiply(tmpVec, startInd, endInd);
         delete[] tmpVec;
         tmpVec = buf;
+
+        double transferStart = MPI_Wtime();
+        MPI_Allgatherv(tmpVec + startInd, rowCount, MPI_DOUBLE, tmpVec, sendcnts, displs, MPI_DOUBLE, MPI_COMM_WORLD);
+        double transferEnd = MPI_Wtime();
+        transferTime += transferEnd - transferStart;
+
         time += step;
     }
+    double workEnd = MPI_Wtime();
 
+    delete[] tmpVec;
+
+    if (processNum == ROOT){
+        cout << "Time used: " << workEnd - workStart << " seconds." << endl;
+        cout << "Data transfer time: " << transferTime << "seconds." << endl;
+        cout.flush();
+    }
+
+    MPI_Finalize();
     return 0;
 }
